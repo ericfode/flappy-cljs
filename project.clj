@@ -26,8 +26,7 @@
 
     :plugins      [[lein-figwheel "0.5.7"]
                    [lein-doo "0.1.7"]
-                   [cider/cider-nrepl "0.13.0"]]
-    }}
+                   [cider/cider-nrepl "0.13.0"]]}}
 
   :cljsbuild
   {:builds

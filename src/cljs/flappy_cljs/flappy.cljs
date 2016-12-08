@@ -250,6 +250,4 @@
       (move-dead-birds)
       (maybe-gen-pipe rand)))
 
-
-
-(st/instrument)
+;(st/instrument)

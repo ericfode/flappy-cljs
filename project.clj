@@ -22,6 +22,7 @@
   {:dev
    {:dependencies [[binaryage/devtools "0.8.2"]
                    [figwheel-sidecar "0.5.7"]
+                   [funcool/lentes "1.2.0"]
                    [com.cemerick/piggieback "0.2.1"]]
 
     :plugins      [[lein-figwheel "0.5.7"]

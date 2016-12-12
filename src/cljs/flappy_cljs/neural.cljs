@@ -2,7 +2,11 @@
   (:require [cljs.spec :as s]
             [clojure.test.check.generators :as gen]
             [cljs.spec.test :as st]
-            [cljs.core :as c]))
+            [lentes.core :as l]
+            [cljs.core.async :as a ]
+            [cljs.core :as c])
+  (:require-macros
+   [cljs.core.async.macros :as am]))
 
 
 (declare make-network make-generation activation clamped-random)
@@ -10,20 +14,23 @@
 
 (s/def ::scaler
   (s/with-gen
-    (s/and #(< % 1)
-           #(> % -1)
+    (s/and #(<= % 1)
+           #(>= % -1)
            number?)
     #(gen/double*
       {:min -0.99 :max 0.99 :infinite? false :NaN? false})))
 
 (s/def ::pos-scaler
   (s/with-gen
-    (s/and #(< % 1)
-           #(> % 0)
+    (s/and #(<= % 1)
+           #(>= % 0)
            number?)
     #(gen/double*
       {:min 0.0001 :max 0.99 :infinite? false :NaN? false})))
 
+
+(s/def ::score-fn
+  (s/fspec :args (s/cat :expected any? :actual any?) :ret ::scaler))
 
 (s/def ::activation
   (s/fspec :args (s/cat :a ::scaler) :ret ::scaler :gen #(gen/return activation)))
@@ -57,9 +64,22 @@
                 ::score-sort
                 ::child-count]))
 
+(def default-evolver
+  {::activation activation
+   ::random-clamped clamped-random
+   ::population 10
+   ::elitism .1
+   ::random-behaviour .5
+   ::mutation-range .5
+   ::mutation-rate .4
+   ::historic 4
+   ::low-historic false
+   ::score-sort 0
+   ::child-count 2})
+
 (s/def ::value ::scaler)
 
-(s/def ::inputs (s/coll-of ::scaler :into []))
+(s/def ::inputs (s/coll-of number? :into []))
 
 (s/def ::weights (s/coll-of ::scaler  :into []))
 
@@ -93,7 +113,7 @@
 
 (s/def ::id integer?)
 
-(s/def ::score int?)
+(s/def ::score (s/or :none nil? :scored number?))
 
 (s/def ::genome
   (s/keys :req [::score
@@ -128,6 +148,10 @@
    ::weights (into [] (take cnt (rest (iterate clamped-random nil))))})
 
 
+(defn make-genome
+ [network]
+ {::score 0
+  ::network network})
 
 (s/fdef make-layer
         :args (s/cat :layer-params (s/keys :opt [::layer-cnt ::id ::input-dim]))
@@ -261,16 +285,18 @@
   [network inputs]
   (-> network
       (update-inputs inputs)
-      (update-in [::layers] compute-layers)
-      ))
+      (update-in [::layers] compute-layers)))
 
-
+(s/fdef make-generation
+        :args (s/+ ::genome)
+        :ret ::generation)
 (defn make-generation
   [& genomes]
-  (apply sorted-set-by
-   (fn [left right]
-     (>= (::score left) (::score right)))
-   genomes))
+  {::genomes
+   (apply sorted-set-by
+          (fn [left right]
+            (>= (::score left) (::score right)))
+          genomes)})
 
 ;Stack overflow 17711308
 (defn close? [tolerance x y]
@@ -286,9 +312,11 @@
 (defn maybe-mutate
    [weight opts]
     (if (<= (rand) (::mutation-rate opts))
-      (+ weight
-         (-  (* (::mutation-range opts) (rand) 2)
-             (::mutation-range opts)))
+      (min 1
+           (max -1
+            (+ weight
+               (-  (* (::mutation-range opts) (rand) 2)
+                   (::mutation-range opts)))))
       weight))
 
 (s/fdef breed-neuron
@@ -303,6 +331,23 @@
   (let [new-neuron (if (<= (rand) 0.5) neuron-left neuron-right)]
     (update new-neuron ::weights (fn [weights] (mapv #(maybe-mutate % opts) weights)))))
 
+(defn each
+  ([]
+   (l/lens (fn [s] (flatten s))
+           (fn [s f] (into (empty s) (map f) s))))
+  ([sub-lens]
+   (l/lens (fn [s] (into (empty s) (map (partial l/focus sub-lens)) s))
+           (fn [s f] (into (empty s) (map (partial l/over sub-lens f)) s)))))
+
+
+(def each-weight
+  (each (comp  (l/key ::neurons) (each  (l/key ::weights)))))
+
+
+(defn- randomize-network-weights
+  [network]
+  (l/over each-weight clamped-random network))
+
 (s/fdef breed-layers
         :args (s/cat :layer-left ::layer :layer-right ::layer :opts ::neural-evolver)
         :ret ::layer
@@ -312,10 +357,18 @@
 
 (defn- breed-layers
   [layer-left layer-right opts]
-  (mapv (fn [left right]
-          (breed-neuron left right opts))
-         (::neurons layer-left)
-         (::neurons layer-left)))
+  (assoc layer-left ::neurons
+          (mapv (fn [left right]
+                  (breed-neuron left right opts))
+                 (::neurons layer-left)
+                 (::neurons layer-right))))
+
+
+(def breed-gen (gen/fmap
+                (fn [[gen-left gen-right]]
+                  [gen-left gen-right 4 {::mutation-range .5}])
+                (gen/tuple (s/gen ::genome) (s/gen ::genome))))
+
 
 (s/fdef breed-one
         :args (s/cat :gen-left ::genome :gen-right ::genome :opts ::neural-evolver)
@@ -324,33 +377,169 @@
 
 (defn- breed-one
   [gen-left gen-right opts]
-  {:score 0
-   :network  (assoc gen-left ::layers
-                    (mapv (fn [left right]
-                                      (breed-layers left right opts))
-                                    (get-in gen-left [::network ::layers])
-                                    (get-in gen-right [::network ::layers])))})
 
-
-(def breed-gen (gen/fmap
-                (fn [[gen-left gen-right]]
-                  [gen-left gen-right 4 {::mutation-range .5}])
-                (gen/tuple (s/gen ::genome) (s/gen ::genome)))) 
+  (let [left-network (::network gen-left)
+        res {::score 0
+             ::network  (assoc left-network ::layers
+                               (mapv (fn [left right]
+                                       (breed-layers left right opts))
+                                     (get-in gen-left [::network ::layers])
+                                     (get-in gen-right [::network ::layers])))}] 
+    res))
 
 (s/fdef breed
         :args (s/cat :gen-left ::genome :gen-right ::genome :num-children pos-int? :opts ::neural-evolver)
-        :ret ::genome
+        :ret ::genomes
         :gen breed-gen)
 
 
-(defn breed
-  [gen-left gen-right num-children & {:or {::mutation-range .1} :as  opts}]
-  (doseq [child-index (range num-children)]
-    (breed-one gen-left gen-right opts)))
 
-(st/instrument)
+(defn breed
+  [gen-left gen-right num-children evolver]
+  (into []
+        (for [child-index (range num-children)]
+          (breed-one gen-left gen-right evolver))))
+
+
+(s/fdef kill-the-weak
+        :args (s/cat :gen ::generation :keep number?)
+        :ret ::generation)
+
+(defn maybe-lens
+  [likelyhood]
+  (letfn [(now? [] (<= (rand) likelyhood))] 
+    (l/lens
+     (fn [s] (when (now?) s))
+     (fn [s f] (if (now?) (f s) s)))))
+
+(def each-weight-genome
+  (comp (l/key ::network) (l/key ::layers) each-weight (each)))
+
+(defonce tests
+  (repeatedly 100  #(list (rand-int 2)  (rand-int 2))))
+
+(defn score-genome
+  [genome]
+  (let [inputs tests
+        correct (map #(apply bit-xor %) inputs)
+        correct-bool (map #(> % .5) correct)
+        guesses (map #(first (outputs  (compute (::network genome) %))) inputs)
+        guesses-bool (map #(> % .5) guesses)
+        results (into []  (map = guesses-bool correct-bool))]
+    (assoc genome ::score  (get  (frequencies results ) 'true 0))))
+
+
+(defn score-genome-analyize
+  [genome]
+  (let [inputs tests
+        correct (map #(apply bit-xor %) inputs)
+        correct-bool (map #(> % .5) correct)
+        computed-networks (map  #(compute (::network genome) %) inputs)
+        guesses (map #(first (outputs %)) computed-networks)
+        guesses-bool (map #(> % .5) guesses)
+        results (into []  (map = guesses-bool correct-bool))
+        results-hash (map (fn
+                            [input output-bool computed-network guesse result]
+                            {:in input
+                             :correct output-bool
+                             :computed computed-network
+                             :out guesse
+                             :correct? result
+                             }
+                            inputs
+                            correct-bool
+                            computed-networks
+                            guesses
+                            results))]
+    (-> genome
+        (assoc ::analysis results-hash)
+        (assoc ::score  (get  (frequencies results ) 'true 0)))))
+
+
+
+(defn log
+  [x]
+  (print x)
+  x)
+
+(def scores
+  (comp (l/key ::genomes) (each (l/key ::score))))
+
+
+(defn score-generation
+  [gen]
+  (update gen ::genomes #(into (empty %) (map score-genome-analyize %))))
+
+(defn find-first
+  [f coll]
+  (first (filter f coll)))
+
+(s/fdef next-generation
+        :args (s/cat :this-gen ::generation :evolver ::neural-evolver)
+        :ret ::generation)
+
+
+(defn next-generation
+  [this-gen evolver]
+  (let [survivers (js/Math.ceil (apply * ((juxt ::elitism ::population) evolver)))
+        randos    (js/Math.ceil (apply * ((juxt ::random-behaviour ::population) evolver)))
+        children  (- (::population evolver) (+ randos survivers))
+        best      (first (::genomes this-gen))
+        second-best (find-first #(not (= (::network %) (::network best))) (::genomes this-gen))]
+    (-> this-gen
+        (update ::genomes #(into (empty %) (take survivers %)))
+        (update ::genomes #(apply conj % (repeatedly randos
+                                                     (fn [] (l/over each-weight-genome
+                                                            (fn [x] (if (> (::mutation-rate evolver)
+                                                                          (rand)) (clamped-random) x)) best)))))
+        (update ::genomes #(apply conj % (breed best second-best children evolver)))
+        (update ::genomes #(into (empty %) (map score-genome) %)))))
+
+(defn first-generation
+  [network-spec evolver]
+  (apply make-generation
+         (repeatedly (::population evolver)
+                     #(make-genome (apply make-network network-spec)))))
+
+(defn generation-seq
+  [first-gen evolver]
+  (iterate #(next-generation % evolver) first-gen))
+
+;(st/instrument)
+
+(def test-gen  (score-generation  (first-generation [2 [3] 1] default-evolver)))
 
 (comment
+  (cljs.pprint/pprint (l/focus scores
+                               (score-generation  (first-generation [2 [3] 1] default-evolver))))
+
+
+  (am/go-loop [g (generation-seq
+                  (score-generation  (first-generation [2 [3] 1] default-evolver))
+
+                  default-evolver)
+               left 100]
+    (cljs.pprint/pprint
+     (l/focus scores (first  g)))
+    (cljs.pprint/pprint  (reduce + (l/focus scores (first g))))
+    (when (< 0  left)
+      (print left)
+      (recur (rest g) (dec left))))
+
+  (let [s (take 20 (generation-seq
+                    (score-generation  (first-generation [2 [4] 1] default-evolver))
+                    default-evolver))]
+    (cljs.pprint/pprint  [  (map #(vector (l/focus scores %)) s)
+                          (mapv #(reduce + (l/focus scores %)) s)
+                          ])))
+
+(comment
+
+  (def keep-going (atom  true))
+
+
+  @keep-going
+
   (def test-network (make-network 2 [5] 2))
 
   (def test-inputs [.3 .4])

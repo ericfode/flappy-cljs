@@ -3,6 +3,7 @@
             [cljs.pprint :as pp]
             [flappy-cljs.flappy :as flap]
             [flappy-cljs.db :as db]
+            [flappy-cljs.neural :as n]
             [cljs.spec :as s]))
 
 
@@ -253,3 +254,12 @@
    (debug "loaded " sprite-key)
    (-> db
        (assoc-in [:sprites sprite-key :loading?] false))))
+
+
+(re-frame/reg-event-db
+ :neural/run-network
+ []
+ (fn [db []]
+
+
+   ))
